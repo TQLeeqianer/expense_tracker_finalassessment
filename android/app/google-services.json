@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "641295667860",
+    "project_id": "expensixfinal",
+    "storage_bucket": "expensixfinal.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:641295667860:android:721b2512efde4a361b9a81",
+        "android_client_info": {
+          "package_name": "com.example.expense_tracker"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBva4CjN-QNCiZas_edxjLxXD3OJss_NBM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
