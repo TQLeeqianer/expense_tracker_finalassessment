@@ -1,12 +1,25 @@
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:provider/provider.dart';
 import 'package:intl/intl.dart';
 import 'package:fl_chart/fl_chart.dart';
 import '../services/auth_service.dart';
 import '../services/firestore_service.dart';
+import '../providers/settings_provider.dart';
 import '../models/transaction_model.dart';
+import 'profile_screen.dart';
+import 'filter_screen.dart';
+import 'see_all_screen.dart';
+import 'scan_screen.dart';
 import '../widgets/add_transaction_sheet.dart';
+import '../screens/atm_locator_screen.dart';
+import '../widgets/ai_analysis_sheet.dart';
+import '../widgets/bank_statement_sheet.dart';
+import '../widgets/app_notification_overlay.dart';
 import '../utils/currency_helper.dart';
+import '../utils/ui_helpers.dart';
+import '../screens/history_comparison_screen.dart';
 
 enum TimeRange { today, thisWeek, thisMonth, thisYear, allTime }
 
@@ -19,7 +32,7 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   TimeRange _selectedRange = TimeRange.thisMonth;
-  String _baseCurrency = 'USD';
+  String get _baseCurrency => Provider.of<SettingsProvider>(context).baseCurrency;
   
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
@@ -32,11 +45,14 @@ class _HomeScreenState extends State<HomeScreen> {
   double? _filterMaxAmount;
   String _filterAccount = '';
   String _currentSortMode = 'Newest';
-
-  bool _isObscured = false;
+  bool _isCheckingGoal = false;
+  final Set<String> _selectedIds = {};
+  bool _isMultiSelectMode = false;
+  bool _showPieChart = true;
 
   String _formatAmount(double amount, {String? currency, bool showDecimals = true}) {
-    if (_isObscured) return '****';
+    final isPrivacyMode = Provider.of<SettingsProvider>(context).isPrivacyModeEnabled;
+    if (isPrivacyMode) return '****';
     final curParams = currency ?? _baseCurrency;
     final formatStr = showDecimals ? "#,##0.00" : "#,##0";
     return '${CurrencyHelper.getSymbol(curParams)} ${NumberFormat(formatStr).format(amount)}';
@@ -54,8 +70,6 @@ class _HomeScreenState extends State<HomeScreen> {
       case TimeRange.today:
         return date.year == now.year && date.month == now.month && date.day == now.day;
       case TimeRange.thisWeek:
-        // A simple "This Week" (last 7 days logic) or actual ISO week.
-        // We'll use within last 7 days and not in the future for safety.
         final difference = now.difference(date).inDays;
         return difference >= 0 && difference <= 7;
       case TimeRange.thisMonth:
@@ -77,9 +91,141 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _handlePrivacyModeToggle() {
+    final settings = Provider.of<SettingsProvider>(context, listen: false);
+    if (!settings.isPrivacyModeEnabled) {
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: const Column(
+            children: [
+              Icon(Icons.privacy_tip, size: 48, color: Colors.blueAccent),
+              SizedBox(height: 12),
+              Text(
+                'Enable Privacy Mode',
+                style: TextStyle(fontWeight: FontWeight.bold),
+                textAlign: TextAlign.center,
+              ),
+            ],
+          ),
+          content: const Text(
+            'Your balances and amounts will be hidden. Tap the eye icon again to disable.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.grey),
+          ),
+          actionsAlignment: MainAxisAlignment.center,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.blueAccent,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+              ),
+              onPressed: () {
+                Navigator.pop(ctx);
+                settings.togglePrivacyMode();
+              },
+              child: const Text('Enable'),
+            ),
+          ],
+        ),
+      );
+    } else {
+      settings.togglePrivacyMode();
+    }
+  }
+
+  void _showGoalReminderDialog(double dailyGoal, double todaySaved, double deficit, String currency, String targetTag) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Column(
+          children: [
+            Icon(Icons.track_changes, size: 48, color: Colors.orange),
+            SizedBox(height: 12),
+            Text(
+              'Savings Target Alert',
+              style: TextStyle(fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        content: Text(
+          "Your monthly goal breaks down to $currency ${dailyGoal.toStringAsFixed(0)} per day for your [#$targetTag] fund.\n\nToday, you have secured $currency ${todaySaved.toStringAsFixed(0)}.\n\nYou're short by $currency ${deficit.toStringAsFixed(0)}. Keep pushing!",
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: Colors.grey, fontSize: 15),
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+            ),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Got it!'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _checkDailyGoalReminder(List<TransactionModel> allTransactions, SettingsProvider settings) async {
+    if (_isCheckingGoal) return;
+    _isCheckingGoal = true;
+
+    if (settings.monthlySavingsGoal <= 0) return;
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final todayStr = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final lastShown = prefs.getString('lastGoalReminderDate');
+      
+      // Exactly once per day
+      if (lastShown == todayStr) return;
+
+      final today = DateTime.now();
+      final daysInMonth = DateTime(today.year, today.month + 1, 0).day;
+      final dailyGoal = settings.monthlySavingsGoal / daysInMonth;
+      final targetTag = settings.savingsTag;
+
+      double todaySavings = 0.0;
+      for (var t in allTransactions) {
+        if (t.status != TransactionStatus.failed && t.status != TransactionStatus.refunded &&
+            t.date.year == today.year && t.date.month == today.month && t.date.day == today.day) {
+          
+          if (t.tags.contains(targetTag)) {
+            double amt = CurrencyHelper.convert(t.amount, t.currency, settings.baseCurrency);
+            // Treat expenses, incomes, or transfers purely as absolute saved value if they are tagged for Savings
+            todaySavings += amt.abs(); 
+          }
+        }
+      }
+
+      if (todaySavings < dailyGoal) {
+        final deficit = dailyGoal - todaySavings;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _showGoalReminderDialog(dailyGoal, todaySavings, deficit, settings.baseCurrency, targetTag);
+          }
+        });
+        await prefs.setString('lastGoalReminderDate', todayStr);
+      }
+    } catch (e) {
+      debugPrint("Error checking goal logic: $e");
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final Color blueColor = Theme.of(context).colorScheme.primary; 
+    final Color blueColor = Theme.of(context).colorScheme.primary;
     
     // Get user email
     final user = Provider.of<AuthService>(context).user;
@@ -87,12 +233,44 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
+      bottomNavigationBar: _isMultiSelectMode
+          ? SafeArea(
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                color: Colors.white,
+                child: Row(
+                  children: [
+                    Text(
+                      '${_selectedIds.length} selected',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    ),
+                    const Spacer(),
+                    TextButton(
+                      onPressed: _cancelMultiSelect,
+                      child: const Text('Cancel'),
+                    ),
+                    const SizedBox(width: 8),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      onPressed: _selectedIds.isEmpty ? null : _deleteSelected,
+                      icon: const Icon(Icons.delete, size: 18),
+                      label: const Text('Delete'),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : null,
       body: StreamBuilder<List<TransactionModel>>(
         stream: FirestoreService().getTransactionsStream(),
         builder: (context, snapshot) {
           
           if (snapshot.hasError) {
-             return Center(child: Text("Error: \${snapshot.error}"));
+             return Center(child: Text("Error: ${snapshot.error}"));
           }
           
           double totalNetWorth = 0;
@@ -101,15 +279,27 @@ class _HomeScreenState extends State<HomeScreen> {
           double currentTransfer = 0;
           
           final allTransactions = (snapshot.data ?? []).where((t) => !t.isDeleted).toList();
+          final settingsProvider = Provider.of<SettingsProvider>(context, listen: false);
+          
+          if (snapshot.connectionState == ConnectionState.active) {
+            _checkDailyGoalReminder(allTransactions, settingsProvider);
+          }
           final List<TransactionModel> filteredTransactions = [];
-          final Map<String, double> walletBalances = {};
+          
+          final Map<String, double> walletBalances = Map.from(settingsProvider.wallets);
+          
+          // Seed the total net worth with the initial wallet balances
+          for (var balance in walletBalances.values) {
+            totalNetWorth += balance;
+          }
           final Map<String, double> expenseByCategory = {};
           
           for (var t in allTransactions) {
             double convertedAmt = CurrencyHelper.convert(t.amount, t.currency, _baseCurrency);
             
-            // Unconditionally calculate Total Net Worth (All Time) and Wallets from valid transactions
+            // Unconditionally calculate Total Net Worth
             if (t.status != TransactionStatus.failed && t.status != TransactionStatus.refunded) {
+
               if (t.type == TransactionType.expense) {
                 totalNetWorth -= convertedAmt;
                 if (t.fromAccount != null && t.fromAccount!.isNotEmpty) {
@@ -130,7 +320,6 @@ class _HomeScreenState extends State<HomeScreen> {
               }
             }
 
-            // Apply selected time filter for Cashflow and transaction list
             bool passTime = true;
             if (_filterStartDate != null && _filterEndDate != null) {
               passTime = t.date.isAfter(_filterStartDate!.subtract(const Duration(days: 1))) && 
@@ -142,9 +331,26 @@ class _HomeScreenState extends State<HomeScreen> {
             if (passTime) {
               bool passSearch = true;
               if (_searchQuery.trim().isNotEmpty) {
-                final query = _searchQuery.trim().toLowerCase();
-                passSearch = t.title.toLowerCase().contains(query) ||
-                             t.tags.any((tag) => tag.toLowerCase().contains(query));
+                final rawQuery = _searchQuery.trim();
+                final queryLower = rawQuery.toLowerCase();
+                final isNegativeSearch = rawQuery.startsWith('-');
+                final isPositiveSearch = rawQuery.startsWith('+');
+                final queryStripped = rawQuery.replaceAll('+', '').replaceAll('-', '').trim();
+                final queryNum = double.tryParse(queryStripped);
+                bool amountMatch = false;
+                if (queryNum != null) {
+                  if (isNegativeSearch) {
+                    amountMatch = t.amount == queryNum && t.type == TransactionType.expense;
+                  } else if (isPositiveSearch) {
+                    amountMatch = t.amount == queryNum && t.type == TransactionType.income;
+                  } else {
+                    amountMatch = t.amount == queryNum;
+                  }
+                }
+                passSearch = t.title.toLowerCase().contains(queryLower) ||
+                             t.category.toLowerCase().contains(queryLower) ||
+                             t.tags.any((tag) => tag.toLowerCase().contains(queryLower)) ||
+                             amountMatch;
               }
               bool passCat = _filterCategory.isEmpty || t.category == _filterCategory;
               bool passType = _filterType == null || t.type == _filterType;
@@ -183,7 +389,6 @@ class _HomeScreenState extends State<HomeScreen> {
 
           return CustomScrollView(
             slivers: [
-              // TOP BLUE COLLAPSIBLE SECTION
               SliverAppBar(
                 backgroundColor: blueColor,
                 expandedHeight: 380,
@@ -207,21 +412,39 @@ class _HomeScreenState extends State<HomeScreen> {
                           children: [
                             Row(
                               children: [
-                                const CircleAvatar(
-                                  radius: 20,
-                                  backgroundColor: Colors.white24,
-                                  child: Icon(Icons.person, color: Colors.white),
+                                InkWell(
+                                  onTap: () {
+                                    Navigator.push(context, MaterialPageRoute(builder: (_) => const ProfileScreen()));
+                                  },
+                                  borderRadius: BorderRadius.circular(20),
+                                  child: Consumer<SettingsProvider>(
+                                    builder: (context, settings, child) {
+                                      final imagePath = settings.profileImagePath;
+                                      return CircleAvatar(
+                                        radius: 20,
+                                        backgroundColor: Colors.white24,
+                                        backgroundImage: imagePath != null && imagePath.length > 500
+                                            ? MemoryImage(base64Decode(imagePath))
+                                            : null,
+                                        child: (imagePath == null || imagePath.length <= 500)
+                                            ? const Icon(Icons.person, color: Colors.white)
+                                            : null,
+                                      );
+                                    },
+                                  ),
                                 ),
-                                const SizedBox(width: 12),
+                              const SizedBox(width: 12),
                                 Column(
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    const Text(
-                                      'Hi, Developer!',
-                                      style: TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
+                                    Consumer<AuthService>(
+                                      builder: (context, auth, _) => Text(
+                                        'Hi, ${auth.user?.displayName ?? 'Developer'}!',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
                                       ),
                                     ),
                                     Text(
@@ -231,19 +454,13 @@ class _HomeScreenState extends State<HomeScreen> {
                                         fontSize: 12,
                                       ),
                                     ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                            IconButton(
-                              onPressed: () async {
-                                await Provider.of<AuthService>(context, listen: false).signOut();
-                              },
-                              icon: const Icon(Icons.logout, color: Colors.white),
-                            )
-                          ],
-                        ),
-                        const SizedBox(height: 24),
+                                  ], // Closes inner Column children
+                                ), // Closes inner Column
+                              ], // Closes inner Row children
+                            ), // Closes inner Row
+                          ], // Closes outer Row children
+                        ), // Closes outer Row
+                      const SizedBox(height: 24),
                         
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -256,11 +473,13 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ),
                                 const SizedBox(width: 8),
                                 GestureDetector(
-                                  onTap: () => setState(() => _isObscured = !_isObscured),
-                                  child: Icon(
-                                    _isObscured ? Icons.visibility_off : Icons.visibility,
-                                    color: Colors.white70,
-                                    size: 18,
+                                  onTap: _handlePrivacyModeToggle,
+                                  child: Consumer<SettingsProvider>(
+                                    builder: (context, provider, child) => Icon(
+                                      provider.isPrivacyModeEnabled ? Icons.visibility_off : Icons.visibility,
+                                      color: Colors.white70,
+                                      size: 18,
+                                    ),
                                   ),
                                 ),
                               ],
@@ -271,9 +490,11 @@ class _HomeScreenState extends State<HomeScreen> {
                               style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
                               icon: const Icon(Icons.arrow_drop_down, color: Colors.white),
                               underline: const SizedBox(),
-                              items: CurrencyHelper.availableCurrencies.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+                              items: Provider.of<SettingsProvider>(context).activeCurrencies.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
                               onChanged: (val) {
-                                if (val != null) setState(() => _baseCurrency = val);
+                                if (val != null) {
+                                  Provider.of<SettingsProvider>(context, listen: false).setBaseCurrency(val);
+                                }
                               },
                             ),
                           ],
@@ -292,23 +513,51 @@ class _HomeScreenState extends State<HomeScreen> {
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            _buildActionItem(Icons.swap_horiz, 'Transfer', () {
+                            _buildActionItem(Icons.qr_code_scanner, 'Scan', () {
+                              Navigator.push(context, MaterialPageRoute(builder: (_) => const ScanScreen()));
+                            }),
+                            _buildActionItem(Icons.auto_awesome, 'AI Insight', () {
+                              final Map<String, dynamic> summaryData = {
+                                'currency': settingsProvider.baseCurrency,
+                                'totalNetWorth': totalNetWorth,
+                                'timeRange': _selectedRange.name,
+                                'totalIncome': currentIncome,
+                                'totalExpense': currentExpense,
+                                'expenseByCategory': expenseByCategory,
+                              };
                               showModalBottomSheet(
                                 context: context,
                                 isScrollControlled: true,
                                 backgroundColor: Colors.transparent,
-                                builder: (context) => const AddTransactionSheet(initialType: TransactionType.transfer),
+                                builder: (_) => AiAnalysisSheet(summaryData: summaryData),
                               );
                             }),
-                            _buildActionItem(Icons.qr_code_scanner, 'Scan', () {
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Receipt Scanning coming soon!')));
+                            _buildActionItem(Icons.history, 'History', () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => HistoryComparisonScreen(
+                                    transactions: allTransactions,
+                                    baseCurrency: settingsProvider.baseCurrency,
+                                  ),
+                                ),
+                              );
                             }),
-                            _buildActionItem(Icons.pie_chart, 'Report', () {
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Advanced Reporting coming soon!')));
+                            _buildActionItem(Icons.map, 'Map', () {
+                              Navigator.push(context, MaterialPageRoute(builder: (_) => const ATMLocatorScreen()));
                             }),
-                            _buildActionItem(Icons.history, 'History', _showFilterSheet),
-                            _buildActionItem(Icons.grid_view, 'More', () {
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('More Features coming soon!')));
+                            _buildActionItem(Icons.picture_as_pdf, 'PDF Sync', () async {
+                              final result = await showModalBottomSheet<bool>(
+                                context: context,
+                                isScrollControlled: true,
+                                backgroundColor: Colors.transparent,
+                                builder: (_) => const BankStatementSheet(),
+                              );
+                              if (result == true && mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('Statements Imported Successfully! 🎉', style: TextStyle(fontWeight: FontWeight.bold)), backgroundColor: Colors.green, behavior: SnackBarBehavior.floating),
+                                );
+                              }
                             }),
                           ],
                         ),
@@ -331,7 +580,6 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               
-              // BOTTOM CARDS SECTION
               SliverToBoxAdapter(
                 child: Padding(
                   padding: const EdgeInsets.all(24.0),
@@ -343,45 +591,49 @@ class _HomeScreenState extends State<HomeScreen> {
                       _buildWalletsList(walletBalances),
                       const SizedBox(height: 32),
                       
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text(
-                            'Cashflow',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 0),
-                            decoration: BoxDecoration(
-                              color: Colors.white,
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(color: Colors.grey.shade300),
-                            ),
-                            child: DropdownButtonHideUnderline(
-                              child: DropdownButton<TimeRange>(
-                                value: _selectedRange,
-                                icon: const Icon(Icons.keyboard_arrow_down, size: 20),
-                                style: const TextStyle(fontSize: 14, color: Colors.black87),
-                                items: TimeRange.values.map((TimeRange range) {
-                                  return DropdownMenuItem<TimeRange>(
-                                    value: range,
-                                    child: Text(_getRangeLabel(range)),
-                                  );
-                                }).toList(),
-                                onChanged: (TimeRange? newValue) {
-                                  if (newValue != null) {
-                                    setState(() {
-                                      _selectedRange = newValue;
-                                    });
+                      const Text(
+                        'Cashflow',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(
+                          children: TimeRange.values.map((range) {
+                            final isSelected = _selectedRange == range;
+                            return Padding(
+                              padding: const EdgeInsets.only(right: 8.0),
+                              child: ChoiceChip(
+                                label: Text(_getRangeLabel(range)),
+                                selected: isSelected,
+                                showCheckmark: false,
+                                selectedColor: Theme.of(context).colorScheme.primary.withOpacity(0.1),
+                                labelStyle: TextStyle(
+                                  color: isSelected ? Theme.of(context).colorScheme.primary : Colors.grey.shade600,
+                                  fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                                ),
+                                backgroundColor: Colors.transparent,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(20),
+                                  side: BorderSide(
+                                    color: isSelected ? Theme.of(context).colorScheme.primary : Colors.grey.shade300,
+                                    width: isSelected ? 1.5 : 1.0,
+                                  ),
+                                ),
+                                elevation: 0,
+                                pressElevation: 0,
+                                onSelected: (bool selected) {
+                                  if (selected) {
+                                    setState(() => _selectedRange = range);
                                   }
                                 },
                               ),
-                            ),
-                          ),
-                        ],
+                            );
+                          }).toList(),
+                        ),
                       ),
                       const SizedBox(height: 16),
                       
@@ -394,7 +646,12 @@ class _HomeScreenState extends State<HomeScreen> {
                               title: 'Income',
                               amount: _formatAmount(currentIncome, showDecimals: false),
                               iconColor: Colors.blue,
-                              bgColor: Colors.white,
+                              bgColor: _filterType == TransactionType.income ? Colors.blue.shade50 : Colors.white,
+                              onTap: () {
+                                setState(() {
+                                  _filterType = _filterType == TransactionType.income ? null : TransactionType.income;
+                                });
+                              },
                             ),
                           ),
                           const SizedBox(width: 8),
@@ -405,20 +662,15 @@ class _HomeScreenState extends State<HomeScreen> {
                               title: 'Spending',
                               amount: _formatAmount(currentExpense, showDecimals: false),
                               iconColor: Colors.green,
-                              bgColor: Colors.white,
+                              bgColor: _filterType == TransactionType.expense ? Colors.green.shade50 : Colors.white,
+                              onTap: () {
+                                setState(() {
+                                  _filterType = _filterType == TransactionType.expense ? null : TransactionType.expense;
+                                });
+                              },
                             ),
                           ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: _buildWalletCard(
-                              context: context,
-                              icon: Icons.swap_horiz,
-                              title: 'Transfer',
-                              amount: _formatAmount(currentTransfer, showDecimals: false),
-                              iconColor: Colors.orange,
-                              bgColor: Colors.white,
-                            ),
-                          ),
+
                         ],
                       ),
                       const SizedBox(height: 32),
@@ -470,7 +722,26 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                       
-                      _buildSectionHeader('Transactions', 'See All'),
+                      GestureDetector(
+                        onTap: () {
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => SeeAllScreen(
+                                filterCategory: _filterCategory,
+                                filterType: _filterType,
+                                filterStartDate: _filterStartDate,
+                                filterEndDate: _filterEndDate,
+                                filterMinAmount: _filterMinAmount,
+                                filterMaxAmount: _filterMaxAmount,
+                                filterAccount: _filterAccount,
+                                sortMode: _currentSortMode,
+                              ),
+                            ),
+                          );
+                        },
+                        child: _buildSectionHeader('Transactions', 'See All'),
+                      ),
                       const SizedBox(height: 16),
                     ],
                   ),
@@ -495,7 +766,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     delegate: SliverChildBuilderDelegate(
                       (context, index) {
                         if (index == filteredTransactions.length) {
-                          return const SizedBox(height: 80); // Added FAB safety boundary
+                          return const SizedBox(height: 80); 
                         }
                         return _buildTransactionTile(filteredTransactions[index]);
                       },
@@ -509,16 +780,53 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: () {
-          // OPEN ADD TRANSACTION BOTTOM SHEET
+          final overlay = Overlay.of(context);
           showModalBottomSheet(
             context: context,
-            isScrollControlled: true, 
+            isScrollControlled: true,
             backgroundColor: Colors.transparent,
             builder: (ctx) => const AddTransactionSheet(),
-          );
+          ).then((saved) {
+            if (mounted && saved == true) {
+              AppNotification.show(
+                overlay,
+                'Transaction saved successfully!',
+                icon: Icons.check_circle,
+                color: Colors.green,
+              );
+            }
+          });
         },
         backgroundColor: blueColor,
         child: const Icon(Icons.add, color: Colors.white),
+      ),
+    );
+  }
+
+  void _showComingSoonDialog(BuildContext context, String title, String message, IconData icon) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Column(
+          children: [
+            Icon(icon, size: 48, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(height: 16),
+            Text(title, style: const TextStyle(fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+          ],
+        ),
+        content: Text(message, textAlign: TextAlign.center, style: const TextStyle(color: Colors.grey)),
+        actionsAlignment: MainAxisAlignment.center,
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+            ),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Got it!'),
+          ),
+        ],
       ),
     );
   }
@@ -575,6 +883,129 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  void _showGenericGoalReminderDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Column(
+          children: [
+            Icon(Icons.savings, size: 48, color: Colors.orange),
+            SizedBox(height: 12),
+            Text(
+              'Savings Reminder',
+              style: TextStyle(fontWeight: FontWeight.bold),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+        content: const Text(
+          "Hey! You haven't saved any money today yet. Don't forget to record your savings!",
+          textAlign: TextAlign.center,
+          style: TextStyle(color: Colors.grey),
+        ),
+        actionsAlignment: MainAxisAlignment.center,
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 12),
+            ),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Got it!'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showWalletOptions(BuildContext context, String walletName, double currentBalance) {
+    showDialog(
+      context: context,
+      builder: (BuildContext ctx) {
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: Text(walletName, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.edit, color: Colors.blue),
+                title: const Text('Edit Wallet Name'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showEditWalletDialog(context, walletName);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete, color: Colors.red),
+                title: const Text('Delete Wallet'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showDeleteWalletDialog(context, walletName);
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  void _showEditWalletDialog(BuildContext context, String oldName) {
+    final controller = TextEditingController(text: oldName);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Edit Wallet Name'),
+        content: TextField(
+          controller: controller,
+          decoration: const InputDecoration(hintText: 'New Wallet Name'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () {
+              if (controller.text.trim().isNotEmpty) {
+                final newName = controller.text.trim();
+                Provider.of<SettingsProvider>(context, listen: false).editWallet(oldName, newName);
+                FirestoreService().reassignWalletTransactions(oldName, newName);
+                Navigator.pop(ctx);
+              }
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDeleteWalletDialog(BuildContext context, String walletName) {
+    if (walletName == 'Default Wallet') {
+      UIHelpers.showAlertDialog(context, 'Action Denied', 'Cannot delete the Default Wallet.');
+      return;
+    }
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete Wallet'),
+        content: Text('Are you sure you want to delete "$walletName"? This will move all its transactions to "Default Wallet".'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red, foregroundColor: Colors.white),
+            onPressed: () {
+              Provider.of<SettingsProvider>(context, listen: false).deleteWallet(walletName);
+              FirestoreService().reassignWalletTransactions(walletName, 'Default Wallet');
+              Navigator.pop(ctx);
+            },
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildWalletsList(Map<String, double> wallets) {
     if (wallets.isEmpty) {
       return const Text("No wallets found. Add a transaction first!", style: TextStyle(color: Colors.grey));
@@ -585,25 +1016,33 @@ class _HomeScreenState extends State<HomeScreen> {
       clipBehavior: Clip.none,
       child: Row(
         children: wallets.entries.map((entry) {
-          return Container(
-            width: 140,
-            margin: const EdgeInsets.only(right: 16),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(16),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withOpacity(0.04),
-                  blurRadius: 10,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Icon(Icons.account_balance_wallet, color: Colors.blueAccent),
+          return GestureDetector(
+            onTap: () => _showWalletOptions(context, entry.key, entry.value),
+            child: Container(
+              width: 140,
+              margin: const EdgeInsets.only(right: 16),
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.04),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Icon(Icons.account_balance_wallet, color: Colors.blueAccent),
+                      const Icon(Icons.more_vert, color: Colors.grey, size: 18),
+                    ]
+                  ),
                 const SizedBox(height: 12),
                 Text(
                   entry.key,
@@ -622,10 +1061,11 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ],
             ),
-          );
-        }).toList(),
-      ),
-    );
+          ),
+        );
+      }).toList(),
+    ),
+  );
   }
 
   Widget _buildWalletCard({
@@ -635,9 +1075,12 @@ class _HomeScreenState extends State<HomeScreen> {
     required String amount,
     required Color iconColor,
     required Color bgColor,
+    required VoidCallback onTap,
   }) {
-    return Container(
-      padding: const EdgeInsets.all(16),
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: bgColor,
         borderRadius: BorderRadius.circular(16),
@@ -652,16 +1095,10 @@ class _HomeScreenState extends State<HomeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              CircleAvatar(
-                radius: 20,
-                backgroundColor: iconColor.withOpacity(0.1),
-                child: Icon(icon, color: iconColor),
-              ),
-              const Icon(Icons.more_horiz, color: Colors.grey),
-            ],
+          CircleAvatar(
+            radius: 20,
+            backgroundColor: iconColor.withOpacity(0.1),
+            child: Icon(icon, color: iconColor),
           ),
           const SizedBox(height: 16),
           Text(
@@ -682,7 +1119,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-    );
+    ));
   }
 
   Widget _buildExpenseChart(Map<String, double> data) {
@@ -708,21 +1145,27 @@ class _HomeScreenState extends State<HomeScreen> {
         PieChartSectionData(
           color: color,
           value: amount,
+          showTitle: percentage >= 3, // Only show big labels on the chart to keep it clean
+          titlePositionPercentageOffset: 1.5,
           title: '${percentage.toStringAsFixed(1)}%',
-          radius: 50,
-          titleStyle: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.white),
+          radius: 55, 
+          titleStyle: const TextStyle(
+            fontSize: 12, 
+            fontWeight: FontWeight.bold, 
+            color: Colors.black87,
+          ),
         ),
       );
       
       legendItems.add(
         Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4.0),
+          padding: const EdgeInsets.symmetric(vertical: 6.0),
           child: Row(
             children: [
               Container(width: 12, height: 12, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
               const SizedBox(width: 8),
-              Expanded(child: Text(category, style: const TextStyle(color: Colors.black87, fontSize: 14))),
-              Text('${CurrencyHelper.getSymbol(_baseCurrency)}${NumberFormat("#,##0.00").format(amount)}', style: const TextStyle(fontWeight: FontWeight.bold)),
+              Expanded(child: Text('$category (${percentage.toStringAsFixed(1)}%)', style: const TextStyle(color: Colors.black87, fontSize: 14))),
+              Text(_formatAmount(amount, showDecimals: true), style: const TextStyle(fontWeight: FontWeight.bold)),
             ],
           ),
         )
@@ -740,37 +1183,131 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
       child: Column(
         children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              IconButton(
+                icon: Icon(_showPieChart ? Icons.bar_chart : Icons.pie_chart, color: Colors.grey),
+                onPressed: () {
+                  setState(() {
+                    _showPieChart = !_showPieChart;
+                  });
+                },
+              ),
+            ],
+          ),
           SizedBox(
             height: 200,
-            child: Stack(
-              children: [
-                PieChart(
-                  PieChartData(
-                    sectionsSpace: 2,
-                    centerSpaceRadius: 60,
-                    sections: sections,
-                  ),
-                ),
-                Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text('Total', style: TextStyle(color: Colors.grey, fontSize: 14)),
-                      Text(
-                        '${CurrencyHelper.getSymbol(_baseCurrency)}${NumberFormat("#,##0").format(total)}', 
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)
+            child: _showPieChart 
+              ? Stack(
+                  children: [
+                    PieChart(
+                      PieChartData(
+                        sectionsSpace: 2,
+                        centerSpaceRadius: 60,
+                        sections: sections,
                       ),
-                    ],
+                    ),
+                    Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text('Total', style: TextStyle(color: Colors.grey, fontSize: 14)),
+                          Text(
+                            _formatAmount(total, showDecimals: false), 
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                )
+              : BarChart(
+                  BarChartData(
+                    alignment: BarChartAlignment.spaceAround,
+                    maxY: data.values.isNotEmpty ? data.values.reduce((a, b) => a > b ? a : b) * 1.2 : 100,
+                    barTouchData: BarTouchData(enabled: false),
+                    titlesData: FlTitlesData(
+                      show: true,
+                      bottomTitles: AxisTitles(
+                        sideTitles: SideTitles(
+                          showTitles: true,
+                          reservedSize: 30,
+                          getTitlesWidget: (double value, TitleMeta meta) {
+                            if (value.toInt() < 0 || value.toInt() >= data.length) return const SizedBox();
+                            final str = data.keys.toList()[value.toInt()];
+                            return Padding(
+                              padding: const EdgeInsets.only(top: 8.0),
+                              child: Text(str.substring(0, str.length > 3 ? 3 : str.length), style: const TextStyle(fontSize: 10)),
+                            );
+                          },
+                        ),
+                      ),
+                      leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                      rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                    ),
+                    gridData: const FlGridData(show: false),
+                    borderData: FlBorderData(show: false),
+                    barGroups: data.entries.toList().asMap().entries.map((entry) {
+                      int idx = entry.key;
+                      double amount = entry.value.value;
+                      return BarChartGroupData(
+                        x: idx,
+                        barRods: [
+                          BarChartRodData(
+                            toY: amount,
+                            color: chartColors[idx % chartColors.length],
+                            width: 20,
+                            borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                          ),
+                        ],
+                      );
+                    }).toList(),
                   ),
                 ),
-              ],
-            ),
           ),
           const SizedBox(height: 24),
           Column(children: legendItems),
         ],
       ),
     );
+  }
+
+  void _enterMultiSelect(String id) {
+    setState(() {
+      _isMultiSelectMode = true;
+      _selectedIds.add(id);
+    });
+  }
+
+  void _toggleSelect(String id) {
+    setState(() {
+      if (_selectedIds.contains(id)) {
+        _selectedIds.remove(id);
+      } else {
+        _selectedIds.add(id);
+      }
+      if (_selectedIds.isEmpty) _isMultiSelectMode = false;
+    });
+  }
+
+  void _cancelMultiSelect() {
+    setState(() {
+      _isMultiSelectMode = false;
+      _selectedIds.clear();
+    });
+  }
+
+  Future<void> _deleteSelected() async {
+    final ids = List<String>.from(_selectedIds);
+    for (final id in ids) {
+      await FirestoreService().deleteTransaction(id);
+    }
+    setState(() {
+      _isMultiSelectMode = false;
+      _selectedIds.clear();
+    });
   }
 
   Widget _buildTransactionTile(TransactionModel t) {
@@ -818,10 +1355,9 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // Swipe to delete capability
     return Dismissible(
       key: Key(t.id),
-      direction: DismissDirection.endToStart,
+      direction: _isMultiSelectMode ? DismissDirection.none : DismissDirection.endToStart,
       background: Container(
         margin: const EdgeInsets.only(bottom: 12),
         padding: const EdgeInsets.symmetric(horizontal: 20),
@@ -833,23 +1369,31 @@ class _HomeScreenState extends State<HomeScreen> {
         child: const Icon(Icons.delete, color: Colors.white),
       ),
       onDismissed: (direction) {
-        FirestoreService().deleteTransaction(t.id);
+        FirestoreService().deleteLinkedTransaction(t);
       },
       child: InkWell(
         onTap: () {
-          showModalBottomSheet(
-            context: context,
-            isScrollControlled: true,
-            backgroundColor: Colors.transparent,
-            builder: (ctx) => AddTransactionSheet(existingTransaction: t),
-          );
+          if (_isMultiSelectMode) {
+            _toggleSelect(t.id);
+          } else {
+            showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              backgroundColor: Colors.transparent,
+              builder: (ctx) => AddTransactionSheet(existingTransaction: t),
+            );
+          }
+        },
+        onLongPress: () {
+          if (!_isMultiSelectMode) _enterMultiSelect(t.id);
         },
         child: Container(
           margin: const EdgeInsets.only(bottom: 12),
           padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: Colors.white,
+          color: _selectedIds.contains(t.id) ? Colors.blue.shade50 : Colors.white,
           borderRadius: BorderRadius.circular(16),
+          border: _selectedIds.contains(t.id) ? Border.all(color: Colors.blue, width: 1.5) : null,
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.02),
@@ -860,6 +1404,14 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         child: Row(
           children: [
+            if (_isMultiSelectMode) ...[
+              Checkbox(
+                value: _selectedIds.contains(t.id),
+                onChanged: (_) => _toggleSelect(t.id),
+                activeColor: Colors.blue,
+              ),
+              const SizedBox(width: 8),
+            ],
             Stack(
               clipBehavior: Clip.none,
               children: [
@@ -879,6 +1431,19 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                       padding: const EdgeInsets.all(2),
                       child: statusIndicator,
+                    ),
+                  ),
+                if (t.linkedTransactionId != null)
+                  Positioned(
+                    right: -4,
+                    bottom: -4,
+                    child: Container(
+                      decoration: const BoxDecoration(
+                        color: Colors.white,
+                        shape: BoxShape.circle,
+                      ),
+                      padding: const EdgeInsets.all(2),
+                      child: const Icon(Icons.link, size: 12, color: Colors.blue),
                     ),
                   ),
               ],
@@ -917,16 +1482,25 @@ class _HomeScreenState extends State<HomeScreen> {
                     Padding(
                       padding: const EdgeInsets.only(top: 8.0),
                       child: Wrap(
-                        spacing: 6,
-                        runSpacing: 6,
-                        children: t.tags.map((tag) => Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.grey.shade200,
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text('#$tag', style: const TextStyle(fontSize: 10, color: Colors.black54, fontWeight: FontWeight.w500)),
-                        )).toList(),
+                        spacing: 8,
+                        runSpacing: 4,
+                        children: t.tags.map((tag) {
+                          Color chipBg;
+                          Color chipText;
+                          switch (t.type) {
+                            case TransactionType.expense:
+                              chipBg = Colors.red.shade100; chipText = Colors.red.shade700; break;
+                            case TransactionType.income:
+                              chipBg = Colors.green.shade100; chipText = Colors.green.shade700; break;
+                            case TransactionType.transfer:
+                              chipBg = Colors.blue.shade100; chipText = Colors.blue.shade700; break;
+                          }
+                          return Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(color: chipBg, borderRadius: BorderRadius.circular(8)),
+                            child: Text('#$tag', style: TextStyle(fontSize: 10, color: chipText, fontWeight: FontWeight.w600)),
+                          );
+                        }).toList(),
                       ),
                     ),
                 ],
@@ -950,207 +1524,33 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  void _showFilterSheet() {
-    final TextEditingController minAmtCtrl = TextEditingController(text: _filterMinAmount?.toString() ?? '');
-    final TextEditingController maxAmtCtrl = TextEditingController(text: _filterMaxAmount?.toString() ?? '');
-    
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (context, setModalState) {
-            return Container(
-              height: MediaQuery.of(context).size.height * 0.85,
-              padding: const EdgeInsets.only(top: 24, left: 24, right: 24, bottom: 24),
-              decoration: const BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-              ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text('Advanced Filters', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 16),
-                  
-                  Expanded(
-                    child: SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Custom Date Range', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  onPressed: () async {
-                                    final DateTimeRange? picked = await showDateRangePicker(
-                                      context: context,
-                                      firstDate: DateTime(2000),
-                                      lastDate: DateTime.now(),
-                                      initialDateRange: _filterStartDate != null && _filterEndDate != null 
-                                          ? DateTimeRange(start: _filterStartDate!, end: _filterEndDate!)
-                                          : null,
-                                    );
-                                    if (picked != null) {
-                                      setModalState(() {
-                                        _filterStartDate = picked.start;
-                                        _filterEndDate = picked.end;
-                                      });
-                                    }
-                                  },
-                                  icon: const Icon(Icons.date_range, size: 18),
-                                  label: Text(_filterStartDate != null && _filterEndDate != null
-                                      ? '${DateFormat('MM/dd').format(_filterStartDate!)} - ${DateFormat('MM/dd').format(_filterEndDate!)}'
-                                      : 'Select Range'),
-                                ),
-                              ),
-                              if (_filterStartDate != null)
-                                IconButton(
-                                  icon: const Icon(Icons.clear, color: Colors.red),
-                                  onPressed: () => setModalState(() { _filterStartDate = null; _filterEndDate = null; }),
-                                )
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-
-                          const Text('Amount Range', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: TextField(
-                                  controller: minAmtCtrl,
-                                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                                  decoration: const InputDecoration(labelText: 'Min', border: OutlineInputBorder(), prefixIcon: Icon(Icons.attach_money, size: 16)),
-                                  onChanged: (val) => _filterMinAmount = double.tryParse(val),
-                                ),
-                              ),
-                              const SizedBox(width: 16),
-                              Expanded(
-                                child: TextField(
-                                  controller: maxAmtCtrl,
-                                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                                  decoration: const InputDecoration(labelText: 'Max', border: OutlineInputBorder(), prefixIcon: Icon(Icons.attach_money, size: 16)),
-                                  onChanged: (val) => _filterMaxAmount = double.tryParse(val),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-
-                          const Text('Account / Wallet', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          DropdownButtonFormField<String>(
-                            value: _filterAccount.isEmpty ? null : _filterAccount,
-                            hint: const Text('All Accounts'),
-                            decoration: const InputDecoration(border: OutlineInputBorder()),
-                            items: ['Cash', 'Bank', 'Credit Card', 'AmBank', 'Maybank'] 
-                                .map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
-                            onChanged: (val) {
-                              setModalState(() => _filterAccount = val ?? '');
-                            },
-                          ),
-                          const SizedBox(height: 16),
-                          
-                          const Text('Category', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          DropdownButtonFormField<String>(
-                            value: _filterCategory.isEmpty ? null : _filterCategory,
-                            hint: const Text('All Categories'),
-                            decoration: const InputDecoration(border: OutlineInputBorder()),
-                            items: ['Shopping', 'Food', 'Transport', 'Entertainment', 'Salary', 'Investment', 'Transfer'] 
-                                .map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
-                            onChanged: (val) {
-                              setModalState(() => _filterCategory = val ?? '');
-                            },
-                          ),
-                          const SizedBox(height: 16),
-
-                          const Text('Transaction Type', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          DropdownButtonFormField<TransactionType>(
-                            value: _filterType,
-                            hint: const Text('All Types'),
-                            decoration: const InputDecoration(border: OutlineInputBorder()),
-                            items: TransactionType.values.map((t) => DropdownMenuItem(value: t, child: Text(t.name.toUpperCase()))).toList(),
-                            onChanged: (val) {
-                              setModalState(() => _filterType = val);
-                            },
-                          ),
-                          const SizedBox(height: 16),
-                          
-                          const Text('Sort By', style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.black54)),
-                          const SizedBox(height: 8),
-                          DropdownButtonFormField<String>(
-                            value: _currentSortMode,
-                            decoration: const InputDecoration(border: OutlineInputBorder()),
-                            items: ['Newest', 'Oldest', 'Highest Amount', 'Lowest Amount']
-                                .map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
-                            onChanged: (val) {
-                              setModalState(() => _currentSortMode = val ?? 'Newest');
-                            },
-                          ),
-                          const SizedBox(height: 24),
-                        ]
-                      )
-                    )
-                  ),
-
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: () {
-                            setModalState(() {
-                              _filterCategory = '';
-                              _filterType = null;
-                              _filterStartDate = null;
-                              _filterEndDate = null;
-                              _filterMinAmount = null;
-                              _filterMaxAmount = null;
-                              _filterAccount = '';
-                              _currentSortMode = 'Newest';
-                            });
-                            setState(() {
-                              _filterCategory = '';
-                              _filterType = null;
-                              _filterStartDate = null;
-                              _filterEndDate = null;
-                              _filterMinAmount = null;
-                              _filterMaxAmount = null;
-                              _filterAccount = '';
-                              _currentSortMode = 'Newest';
-                            });
-                            Navigator.pop(ctx);
-                          },
-                          style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
-                          child: const Text('Reset', style: TextStyle(fontSize: 16)),
-                        ),
-                      ),
-                      const SizedBox(width: 16),
-                      Expanded(
-                        child: ElevatedButton(
-                          onPressed: () {
-                            setState(() {}); // Apply state change broadly across board
-                            Navigator.pop(ctx);
-                          },
-                          style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16), backgroundColor: Colors.blueAccent),
-                          child: const Text('Apply Filters', style: TextStyle(fontSize: 16, color: Colors.white)),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                ],
-              ),
-            );
-          }
-        );
-      },
+  void _showFilterSheet() async {
+    final result = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => FilterScreen(
+          initialCategory: _filterCategory,
+          initialType: _filterType,
+          initialStartDate: _filterStartDate,
+          initialEndDate: _filterEndDate,
+          initialMinAmount: _filterMinAmount,
+          initialMaxAmount: _filterMaxAmount,
+          initialAccount: _filterAccount,
+          initialSortMode: _currentSortMode,
+        ),
+      ),
     );
+    if (result != null && mounted) {
+      setState(() {
+        _filterCategory = result['filterCategory'] as String;
+        _filterType = result['filterType'] as TransactionType?;
+        _filterStartDate = result['filterStartDate'] as DateTime?;
+        _filterEndDate = result['filterEndDate'] as DateTime?;
+        _filterMinAmount = result['filterMinAmount'] as double?;
+        _filterMaxAmount = result['filterMaxAmount'] as double?;
+        _filterAccount = result['filterAccount'] as String;
+        _currentSortMode = result['currentSortMode'] as String;
+      });
+    }
   }
 }

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/auth_service.dart';
 import 'home_screen.dart';
+import '../utils/ui_helpers.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -11,6 +12,7 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
+  final _nameController = TextEditingController();
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _isLoading = false;
@@ -27,7 +29,13 @@ class _LoginScreenState extends State<LoginScreen> {
         _passwordController.text.trim()
       );
     } else {
+      if (_nameController.text.trim().isEmpty) {
+         setState(() => _isLoading = false);
+         UIHelpers.showAlertDialog(context, 'Name Required', 'Please enter your name or a username.');
+         return;
+      }
       error = await authService.register(
+        _nameController.text.trim(),
         _emailController.text.trim(), 
         _passwordController.text.trim()
       );
@@ -36,10 +44,80 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() => _isLoading = false);
 
     if (error != null && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(error), backgroundColor: Colors.red),
-      );
+      UIHelpers.showAlertDialog(context, 'Authentication Error', error);
     }
+  }
+
+  void _showForgotPasswordDialog() {
+    final emailCtrl = TextEditingController(text: _emailController.text.trim());
+    bool isSending = false;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          title: const Text('Reset Password', textAlign: TextAlign.center, style: TextStyle(fontWeight: FontWeight.bold)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'Enter your registered email and we\'ll send you a reset link.',
+                style: TextStyle(color: Colors.grey),
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: emailCtrl,
+                keyboardType: TextInputType.emailAddress,
+                decoration: InputDecoration(
+                  labelText: 'Email Address',
+                  prefixIcon: const Icon(Icons.email),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+            ],
+          ),
+          actionsAlignment: MainAxisAlignment.center,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Theme.of(context).colorScheme.primary,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onPressed: isSending
+                  ? null
+                  : () async {
+                      setDialogState(() => isSending = true);
+                      final authService = Provider.of<AuthService>(context, listen: false);
+                      final error = await authService.sendPasswordResetEmail(emailCtrl.text);
+                      if (!ctx.mounted) return;
+                      Navigator.pop(ctx);
+                      if (!mounted) return;
+                      if (error != null) {
+                        UIHelpers.showAlertDialog(context, 'Error', error);
+                      } else {
+                        UIHelpers.showAlertDialog(context, 'Email Sent',
+                            'A password reset link has been sent to ${emailCtrl.text.trim()}. Check your inbox.');
+                      }
+                    },
+              child: isSending
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                    )
+                  : const Text('Send Link'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
@@ -65,6 +143,19 @@ class _LoginScreenState extends State<LoginScreen> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 40),
+              
+              if (!_isLogin) ...[
+                TextField(
+                  controller: _nameController,
+                  decoration: InputDecoration(
+                    labelText: 'Full Name or Username',
+                    prefixIcon: const Icon(Icons.person_outline),
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  textCapitalization: TextCapitalization.words,
+                ),
+                const SizedBox(height: 16),
+              ],
               
               TextField(
                 controller: _emailController,
@@ -109,12 +200,18 @@ class _LoginScreenState extends State<LoginScreen> {
                     _isLogin = !_isLogin;
                   });
                 },
-                child: Text(_isLogin 
-                  ? "Don't have an account? Sign Up" 
+                child: Text(_isLogin
+                  ? "Don't have an account? Sign Up"
                   : "Already have an account? Sign In"
                 ),
               ),
-              
+
+              if (_isLogin)
+                TextButton(
+                  onPressed: _showForgotPasswordDialog,
+                  child: const Text('Forgot Password?', style: TextStyle(color: Colors.grey)),
+                ),
+
               const SizedBox(height: 40),
               // Temporary bypass button for development UI testing
               TextButton(

@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import 'services/auth_service.dart';
+import 'providers/settings_provider.dart';
 import 'screens/login_screen.dart';
 import 'screens/home_screen.dart';
 import 'firebase_options.dart';
@@ -26,6 +27,10 @@ class MyApp extends StatelessWidget {
     return MultiProvider(
       providers: [
         ChangeNotifierProvider(create: (_) => AuthService()),
+        ChangeNotifierProxyProvider<AuthService, SettingsProvider>(
+          create: (_) => SettingsProvider(),
+          update: (_, auth, settings) => settings!..updateUser(auth.user?.uid),
+        ),
       ],
       child: MaterialApp(
         title: 'Expensix',

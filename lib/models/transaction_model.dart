@@ -12,11 +12,11 @@ class TransactionModel {
   final List<String> tags;
   final bool isDeleted;
   final String currency;
-  
   final TransactionType type;
   final TransactionStatus status;
   final String? fromAccount;
   final String? toAccount;
+  final String? linkedTransactionId;
 
   TransactionModel({
     required this.id,
@@ -31,12 +31,12 @@ class TransactionModel {
     this.status = TransactionStatus.completed,
     this.fromAccount,
     this.toAccount,
+    this.linkedTransactionId,
   });
 
   factory TransactionModel.fromFirestore(DocumentSnapshot doc) {
     Map<String, dynamic> data = doc.data() as Map<String, dynamic>;
-    
-    // Fallback logic for legacy `isExpense` field
+
     TransactionType parsedType = TransactionType.expense;
     if (data.containsKey('type')) {
       parsedType = TransactionType.values.firstWhere(
@@ -44,8 +44,8 @@ class TransactionModel {
         orElse: () => TransactionType.expense,
       );
     } else if (data.containsKey('isExpense')) {
-      parsedType = data['isExpense'] == true 
-          ? TransactionType.expense 
+      parsedType = data['isExpense'] == true
+          ? TransactionType.expense
           : TransactionType.income;
     }
 
@@ -60,7 +60,9 @@ class TransactionModel {
     return TransactionModel(
       id: doc.id,
       title: data['title'] ?? '',
-      amount: (data['amount'] ?? 0).toDouble(),
+      amount: data['amount'] is num 
+          ? (data['amount'] as num).toDouble() 
+          : double.tryParse(data['amount']?.toString() ?? '0') ?? 0.0,
       category: data['category'] ?? '',
       date: (data['date'] as Timestamp).toDate(),
       tags: data['tags'] != null ? List<String>.from(data['tags']) : [],
@@ -70,6 +72,7 @@ class TransactionModel {
       status: parsedStatus,
       fromAccount: data['fromAccount'],
       toAccount: data['toAccount'],
+      linkedTransactionId: data['linkedTransactionId'],
     );
   }
 
@@ -86,6 +89,7 @@ class TransactionModel {
       'status': status.name,
       if (fromAccount != null) 'fromAccount': fromAccount,
       if (toAccount != null) 'toAccount': toAccount,
+      if (linkedTransactionId != null) 'linkedTransactionId': linkedTransactionId,
     };
   }
 }
